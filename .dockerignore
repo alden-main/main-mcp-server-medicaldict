@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.py[codz]
+.DS_Store
+.pytest_cache
+.ruff_cache
+.mypy_cache
+data/analysis-history.sqlite
+tests
+docs
+medicmcp.md
+generate-docs-from-request.md
+implement-from-design-docs.md

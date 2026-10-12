@@ -1,0 +1,21 @@
+[project]
+name = "main-mcp-server-medicaldict"
+version = "0.1.0"
+description = "활성 의학용어 사전을 기반으로 문서를 검토하는 MCP 서버"
+readme = "README.md"
+authors = [
+    { name = "alden-main", email = "alden@gkmain.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "files-to-prompt>=0.6",
+    "mcp>=1.0,<2.0",
+    "pydantic>=2.0,<3.0",
+]
+
+[project.scripts]
+main-mcp-server-medicaldict = "main_mcp_server_medicaldict.server:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"

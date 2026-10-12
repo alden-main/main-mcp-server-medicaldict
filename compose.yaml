@@ -1,0 +1,28 @@
+services:
+  medical-term-review:
+    build: .
+    image: medical-term-review-mcp:local
+    environment:
+      MEDICALDICT_MCP_TRANSPORT: streamable-http
+      MEDICALDICT_MCP_HOST: 0.0.0.0
+      MEDICALDICT_MCP_PORT: "8000"
+    expose:
+      - "8000"
+    volumes:
+      - medicaldict-history:/var/lib/medicaldict
+    networks:
+      - mcp-gateway-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  medicaldict-history:
+
+networks:
+  mcp-gateway-network:
+    external: true
+    name: mcp-gateway-network
