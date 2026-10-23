@@ -76,4 +76,6 @@ FastAPI는 필요하지 않습니다. 이 서버는 FastMCP의 `streamable-http`
 - `MEDICALDICT_MCP_HOST`: HTTP 리스너 주소. 컨테이너에서는 `0.0.0.0`을 사용합니다.
 - `MEDICALDICT_MCP_PORT`: HTTP 리스너 포트. 기본값은 `8000`입니다.
 
+분석 응답은 최대 1,000개의 정확 일치 suggestion으로 제한됩니다. 한도를 넘으면 MCP 도구 호출은 성공으로 반환되지만 `status`는 `partially_completed`, `error_code`는 `result_limit_exceeded`가 됩니다. 호출자는 더 작은 문서 청크로 나누어 다시 분석해야 합니다.
+
 이 프로젝트의 요구사항 범위에는 실제 인증·조직 권한이 포함되지 않습니다. 따라서 인증 없는 Streamable HTTP 서버를 공개 인터넷에 노출하면 안 됩니다.

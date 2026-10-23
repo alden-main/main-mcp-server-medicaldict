@@ -7,12 +7,15 @@ import unittest
 import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import httpx
+from mcp import types
+from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS
 
 from main_mcp_server_medicaldict.analysis import DocumentAnalyzer, SuggestionValidator
 from main_mcp_server_medicaldict.dictionary import DictionaryRepository
-from main_mcp_server_medicaldict.models import CandidateType, DecisionStatus, IssueType, MatchType
+from main_mcp_server_medicaldict.models import AnalysisStatus, CandidateType, DecisionStatus, IssueType, MatchType
 from main_mcp_server_medicaldict.store import AnalysisStore, StoreError
 from main_mcp_server_medicaldict.server import create_server
 
@@ -40,6 +43,32 @@ class MedicalDictionaryTests(unittest.TestCase):
         matches = [item for item in result.suggestions if item.source_text == "당뇨병"]
         self.assertTrue(matches)
         self.assertEqual(text[matches[0].start_offset:matches[0].end_offset], "당뇨병")
+
+    def test_repeated_korean_prefixes_reuse_bounded_dictionary_cache(self) -> None:
+        """반복 한글 구간은 같은 prefix마다 SQLite를 다시 열지 않는다."""
+        text = "당뇨병" * 100
+        analyzer = DocumentAnalyzer(self.repository)
+        with patch.object(self.repository, "_connect", wraps=self.repository._connect) as connect:
+            first = analyzer.analyze(text)
+            first_connection_count = connect.call_count
+            second = analyzer.analyze(text)
+            second_connection_count = connect.call_count - first_connection_count
+        self.assertEqual(
+            [(item.start_offset, item.end_offset, item.recommended_term.term_code) for item in first.suggestions],
+            [(item.start_offset, item.end_offset, item.recommended_term.term_code) for item in second.suggestions],
+        )
+        # 첫 분석은 전체 299개 위치가 아닌 고유 두 글자 prefix 3개와 exact
+        # lookup만 수행하며, 두 번째 분석은 prefix 결과를 모두 재사용한다.
+        self.assertLessEqual(first_connection_count, 4)
+        self.assertEqual(second_connection_count, 1)
+
+    def test_analysis_limits_result_size_before_serialization(self) -> None:
+        """반복 용어가 있어도 MCP 응답이 무제한으로 커지지 않는다."""
+        analyzer = DocumentAnalyzer(self.repository, max_suggestions=10)
+        result = analyzer.analyze("당뇨병" * 20)
+        self.assertEqual(len(result.suggestions), 10)
+        self.assertEqual(result.status, AnalysisStatus.PARTIALLY_COMPLETED)
+        self.assertEqual(result.error_code, "result_limit_exceeded")
 
     def test_validator_rejects_invalid_term_code_and_range(self) -> None:
         """환각 사전 코드와 문서 밖 범위의 LLM 응답은 공개하지 않는다."""
@@ -102,11 +131,13 @@ class MedicalDictionaryTests(unittest.TestCase):
         self.assertTrue(any(hit.match_type is MatchType.SYNONYM_OR_ABBREVIATION for hit in aliases.results))
 
     def test_extended_mcp_tools_are_registered(self) -> None:
-        """확장 분석·검색·근거 제출 도구가 기존 호환 도구와 함께 등록된다."""
+        """Gateway catalog의 모든 도구가 이름·설명·객체 입력 스키마를 제공한다."""
         with TemporaryDirectory() as directory:
             server = create_server(ROOT / "data/dictionary-snapshots", Path(directory) / "history.sqlite")
-            names = {tool.name for tool in asyncio.run(server.list_tools())}
+            tools = asyncio.run(server.list_tools())
+            names = {tool.name for tool in tools}
         self.assertTrue({"analyze_document_terms", "search_medical_terms", "submit_review_suggestions"}.issubset(names))
+        self.assertTrue(all(tool.name and isinstance(tool.description, str) and tool.description and isinstance(tool.inputSchema, dict) for tool in tools))
 
     def test_server_accepts_network_listener_configuration(self) -> None:
         """원격 MCP 배포는 FastMCP의 Streamable HTTP 리스너 설정을 사용한다."""
@@ -131,6 +162,62 @@ class MedicalDictionaryTests(unittest.TestCase):
             response = asyncio.run(request_health())
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok", "service_id": "medical-term-review"})
+
+    def test_gateway_tool_contract_returns_structured_success_and_safe_errors(self) -> None:
+        """Gateway는 성공·입력 오류·과대 요청을 MCP tool result로 구분할 수 있다."""
+        with TemporaryDirectory() as directory:
+            server = create_server(
+                ROOT / "data/dictionary-snapshots", Path(directory) / "history.sqlite", max_text_chars=3,
+            )
+            handler = server._mcp_server.request_handlers[types.CallToolRequest]
+
+            async def call(arguments: dict) -> types.CallToolResult:
+                response = await handler(types.CallToolRequest(
+                    params=types.CallToolRequestParams(name="analyze_document_terms", arguments=arguments),
+                ))
+                self.assertIsInstance(response.root, types.CallToolResult)
+                return response.root
+
+            success = asyncio.run(call({"text": "당뇨병"}))
+            self.assertFalse(success.isError)
+            self.assertIn("result", success.structuredContent or {})
+            candidate = success.structuredContent["result"]["candidates"][0]
+            self.assertTrue({"start_offset", "end_offset", "candidate_type"}.issubset(candidate))
+
+            too_large = asyncio.run(call({"text": "가나다라마바사"}))
+            self.assertTrue(too_large.isError)
+            self.assertEqual(too_large.structuredContent["result"]["error"], {
+                "code": "request_too_large", "message": "text는 3자 이하여야 합니다.", "retryable": False,
+            })
+
+            invalid = asyncio.run(call({"text": 1}))
+            self.assertTrue(invalid.isError)
+            self.assertEqual(invalid.structuredContent["result"]["error"]["code"], "invalid_input")
+
+    def test_unready_dictionary_returns_503_health_and_tool_error(self) -> None:
+        """활성 사전이 없으면 health와 도구가 준비되지 않음만 노출한다."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "missing-snapshot"
+            server = create_server(root, Path(directory) / "history.sqlite")
+
+            async def request_health() -> httpx.Response:
+                transport = httpx.ASGITransport(app=server.streamable_http_app())
+                async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                    return await client.get("/healthz")
+
+            health = asyncio.run(request_health())
+            self.assertEqual(health.status_code, 503)
+            self.assertEqual(health.json(), {"status": "unavailable", "service_id": "medical-term-review"})
+            handler = server._mcp_server.request_handlers[types.CallToolRequest]
+            result = asyncio.run(handler(types.CallToolRequest(
+                params=types.CallToolRequestParams(name="analyze_document_terms", arguments={"text": "당뇨병"}),
+            ))).root
+            self.assertTrue(result.isError)
+            self.assertEqual(result.structuredContent["result"]["error"]["code"], "dictionary_unavailable")
+
+    def test_installed_mcp_supports_gateway_protocol_version(self) -> None:
+        """사용 중인 MCP 런타임이 Gateway의 2025-06-18 세션 협상을 지원한다."""
+        self.assertIn("2025-06-18", SUPPORTED_PROTOCOL_VERSIONS)
 
     def test_review_suggestion_requires_owned_candidate_and_matching_code(self) -> None:
         """확장 제안은 같은 분석 후보 범위와 그 후보가 허용한 코드에만 연결된다."""

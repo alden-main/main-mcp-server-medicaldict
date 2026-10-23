@@ -19,6 +19,9 @@ from .models import (
 )
 
 
+DEFAULT_MAX_ANALYSIS_SUGGESTIONS = 1_000
+
+
 class ValidationError(ValueError):
     """호출자 입력 또는 LLM 구조화 응답의 계약 위반을 나타낸다."""
 
@@ -92,9 +95,12 @@ class SuggestionValidator:
 class DocumentAnalyzer:
     """LLM 호출 없이 문서의 정확 일치 사전 후보를 결정적으로 추출한다."""
 
-    def __init__(self, dictionary: DictionaryRepository) -> None:
+    def __init__(self, dictionary: DictionaryRepository, max_suggestions: int = DEFAULT_MAX_ANALYSIS_SUGGESTIONS) -> None:
         """활성 사전 저장소를 주입한다."""
+        if max_suggestions < 1:
+            raise ValueError("max_suggestions는 1 이상이어야 합니다.")
         self._dictionary = dictionary
+        self._max_suggestions = max_suggestions
 
     def analyze(self, text: str) -> AnalysisResult:
         """문서에서 정확 일치 용어를 찾아 사전 근거와 문자 범위를 반환한다.
@@ -109,8 +115,14 @@ class DocumentAnalyzer:
             raise ValidationError("text는 비어 있지 않은 문자열이어야 합니다.")
         if len(text) > 100_000:
             raise ValidationError("text는 100,000자 이하여야 합니다.")
-        suggestions = self._exact_suggestions(text)
-        result = AnalysisResult(str(uuid4()), self._dictionary.version, AnalysisStatus.COMPLETED, suggestions)
+        suggestions, truncated = self._exact_suggestions(text)
+        result = AnalysisResult(
+            str(uuid4()),
+            self._dictionary.version,
+            AnalysisStatus.PARTIALLY_COMPLETED if truncated else AnalysisStatus.COMPLETED,
+            suggestions,
+            error_code="result_limit_exceeded" if truncated else None,
+        )
         return result
 
     def analyze_document(self, text: str, document_offset: int = 0) -> AnalysisResult:
@@ -126,7 +138,7 @@ class DocumentAnalyzer:
         self._validate_text(text)
         if not isinstance(document_offset, int) or document_offset < 0:
             raise ValidationError("document_offset은 0 이상의 Unicode code point 오프셋이어야 합니다.")
-        exact = self._exact_suggestions(text)
+        exact, truncated = self._exact_suggestions(text)
         candidates: list[DocumentTermCandidate] = []
         seen_ranges: set[tuple[int, int]] = set()
         by_range: dict[tuple[int, int], list[DictionaryTerm]] = {}
@@ -146,18 +158,30 @@ class DocumentAnalyzer:
             similar = [hit.term for hit in self._dictionary.search(source, limit=3).results if hit.match_type.value == "similar"]
             if similar:
                 candidates.append(DocumentTermCandidate(str(uuid4()), start + document_offset, end + document_offset, CandidateType.UNKNOWN_OR_POSSIBLE_TYPO, similar))
-        return AnalysisResult(str(uuid4()), self._dictionary.version, AnalysisStatus.COMPLETED, candidates=candidates)
+        return AnalysisResult(
+            str(uuid4()),
+            self._dictionary.version,
+            AnalysisStatus.PARTIALLY_COMPLETED if truncated else AnalysisStatus.COMPLETED,
+            error_code="result_limit_exceeded" if truncated else None,
+            candidates=candidates,
+        )
 
-    def _exact_suggestions(self, text: str) -> list[Suggestion]:
-        """공백 기준 최대 여섯 단어 구간을 조회해 원문 범위가 있는 정확 일치 결과를 만든다."""
+    def _exact_suggestions(self, text: str) -> tuple[list[Suggestion], bool]:
+        """정확 일치 결과를 상한까지 만들고, 초과 여부를 함께 반환한다."""
         suggestions: list[Suggestion] = []
         seen: set[tuple[int, int, str, str, str]] = set()
+        truncated = False
 
         def append(start: int, end: int, term: DictionaryTerm) -> None:
+            nonlocal truncated
             key = (start, end, term.source_id, term.term_code, term.concept_code)
-            if key not in seen:
-                seen.add(key)
-                suggestions.append(Suggestion(str(uuid4()), text[start:end], start, end, ReviewStatus.NO_CHANGE, term, "활성 사전에 정확히 일치하는 용어입니다.", Confidence.HIGH))
+            if key in seen:
+                return
+            if len(suggestions) >= self._max_suggestions:
+                truncated = True
+                return
+            seen.add(key)
+            suggestions.append(Suggestion(str(uuid4()), text[start:end], start, end, ReviewStatus.NO_CHANGE, term, "활성 사전에 정확히 일치하는 용어입니다.", Confidence.HIGH))
 
         for match in re.finditer(r"[A-Za-z가-힣][A-Za-z가-힣0-9()/.+\- ]*", text):
             words = list(re.finditer(r"\S+", match.group()))
@@ -168,6 +192,8 @@ class DocumentAnalyzer:
                     source = text[start:end]
                     for term in self._dictionary.find_exact(source):
                         append(start, end, term)
+                        if truncated:
+                            return suggestions, True
         for match in re.finditer(r"[가-힣]{2,}", text):
             block = match.group()
             for index in range(len(block) - 1):
@@ -175,7 +201,9 @@ class DocumentAnalyzer:
                     name = term.kor_name
                     if block.startswith(name, index):
                         append(match.start() + index, match.start() + index + len(name), term)
-        return suggestions
+                        if truncated:
+                            return suggestions, True
+        return suggestions, False
 
     @staticmethod
     def _validate_text(text: str) -> None:

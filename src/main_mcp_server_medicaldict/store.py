@@ -86,6 +86,18 @@ class AnalysisStore:
                      candidate.candidate_type.value, json.dumps([term.to_dict() for term in candidate.terms])),
                 )
 
+    def check_ready(self) -> None:
+        """이력 SQLite가 기본 질의를 수행할 수 있는지 확인한다.
+
+        Raises:
+            StoreError: 이력 SQLite에 연결하거나 질의할 수 없을 때 발생한다.
+        """
+        try:
+            with self._connect() as connection:
+                connection.execute("SELECT 1").fetchone()
+        except sqlite3.Error as error:
+            raise StoreError("이력 저장소를 준비할 수 없습니다.") from error
+
     def get(self, analysis_id: str) -> AnalysisResult | None:
         """분석 ID로 저장된 분석과 제안을 다시 조립해 반환한다."""
         with self._connect() as connection:

@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from threading import RLock
 from collections import OrderedDict
 from difflib import SequenceMatcher
 from pathlib import Path
 from uuid import uuid4
 
 from .models import DictionaryTerm, MatchType, SearchHit, SearchResult
+
+
+KOREAN_PREFIX_CACHE_SIZE = 1_024
 
 
 class DictionaryConfigurationError(RuntimeError):
@@ -42,6 +46,11 @@ class DictionaryRepository:
         if not self._database_path.is_file():
             raise DictionaryConfigurationError("활성 사전 SQLite 파일을 찾을 수 없습니다.")
         self._search_results: OrderedDict[str, SearchResult] = OrderedDict()
+        # 분석기는 한글 연속 구간의 모든 문자 위치에서 두 글자 접두어를
+        # 확인한다. 활성 스냅샷은 프로세스 수명 중 바뀌지 않으므로 결과를
+        # 제한된 LRU로 재사용해 반복 SQLite 연결·질의를 피한다.
+        self._korean_prefix_cache: OrderedDict[str, tuple[DictionaryTerm, ...]] = OrderedDict()
+        self._korean_prefix_cache_lock = RLock()
 
     def find_exact(self, expression: str) -> list[DictionaryTerm]:
         """표현의 한글·영문 정규화 컬럼을 모두 조회한다.
@@ -65,6 +74,18 @@ class DictionaryRepository:
             rows = connection.execute(query, (normalized, compact, normalized, compact)).fetchall()
         return [DictionaryTerm(*row) for row in rows]
 
+    def check_ready(self) -> None:
+        """활성 사전 파일과 필수 테이블을 읽을 수 있는지 확인한다.
+
+        Raises:
+            DictionaryConfigurationError: SQLite 파일 또는 필수 테이블을 읽을 수 없을 때 발생한다.
+        """
+        try:
+            with self._connect() as connection:
+                connection.execute("SELECT 1 FROM snapshot_term LIMIT 1").fetchone()
+        except sqlite3.Error as error:
+            raise DictionaryConfigurationError("활성 사전을 읽을 수 없습니다.") from error
+
     def find_by_code(self, source_id: str, term_code: str, concept_code: str) -> DictionaryTerm | None:
         """LLM 응답 검증에 사용할 사전 코드의 실제 존재 여부를 확인한다."""
         query = """
@@ -77,15 +98,29 @@ class DictionaryRepository:
 
     def find_korean_prefix(self, prefix: str) -> list[DictionaryTerm]:
         """공백 없는 한글 문장 안의 용어를 찾기 위해 접두어 후보를 조회한다."""
-        if len(prefix) < 2:
+        normalized = normalize_term(prefix)
+        if len(normalized) < 2:
             return []
+        with self._korean_prefix_cache_lock:
+            cached = self._korean_prefix_cache.get(normalized)
+            if cached is not None:
+                self._korean_prefix_cache.move_to_end(normalized)
+                return list(cached)
         query = """
             SELECT source_id, term_code, concept_code, eng_name, kor_name, description
             FROM snapshot_term WHERE normalized_kor_name GLOB ?
         """
         with self._connect() as connection:
-            rows = connection.execute(query, (f"{normalize_term(prefix)}*",)).fetchall()
-        return [DictionaryTerm(*row) for row in rows]
+            rows = connection.execute(query, (f"{normalized}*",)).fetchall()
+        terms = tuple(DictionaryTerm(*row) for row in rows)
+        with self._korean_prefix_cache_lock:
+            # 다른 동시 요청이 같은 prefix를 먼저 채웠어도 동등한 snapshot
+            # 결과이므로 새 조회 결과를 안전하게 사용한다.
+            self._korean_prefix_cache[normalized] = terms
+            self._korean_prefix_cache.move_to_end(normalized)
+            while len(self._korean_prefix_cache) > KOREAN_PREFIX_CACHE_SIZE:
+                self._korean_prefix_cache.popitem(last=False)
+        return list(terms)
 
     def search(self, query: str, limit: int = 10, match_modes: set[MatchType] | None = None) -> SearchResult:
         """색인된 정규화 키의 제한된 접두 후보만 점수화해 검색한다.
